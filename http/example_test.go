@@ -2,13 +2,14 @@ package sentryhttp_test
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/getsentry/sentry-go"
 	sentryhttp "github.com/getsentry/sentry-go/http"
 )
 
 // For a longer and executable example, see
-// https://github.com/getsentry/sentry-go/tree/master/example/http.
+// https://github.com/getsentry/sentry-go/tree/master/_examples/http.
 func Example() {
 	// Initialize the Sentry SDK once in the main function.
 	// sentry.Init(...)
@@ -29,5 +30,11 @@ func Example() {
 	// Alternatively, you can also wrap individual handlers if you need to use
 	// different options for different parts of your app.
 	handler := sentryhttp.New(sentryhttp.Options{}).Handle(http.DefaultServeMux)
-	http.ListenAndServe(":0", handler)
+
+	server := http.Server{
+		Addr:              ":0",
+		ReadHeaderTimeout: 3 * time.Second,
+		Handler:           handler,
+	}
+	server.ListenAndServe()
 }

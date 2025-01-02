@@ -2,9 +2,10 @@ package sentry
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
@@ -14,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getsentry/sentry-go/internal/testutils"
 	"github.com/google/go-cmp/cmp"
+	"go.uber.org/goleak"
 )
 
 type unserializableType struct {
@@ -77,8 +80,8 @@ func TestGetRequestBodyFromEventInvalidExtraField(t *testing.T) {
 func TestGetRequestBodyFromEventInvalidContextField(t *testing.T) {
 	body := getRequestBodyFromEvent(&Event{
 		Message: "mkey",
-		Contexts: map[string]interface{}{
-			"wat": unserializableType{},
+		Contexts: map[string]Context{
+			"wat": {"key": unserializableType{}},
 		},
 	})
 
@@ -101,8 +104,8 @@ func TestGetRequestBodyFromEventMultipleInvalidFields(t *testing.T) {
 		Extra: map[string]interface{}{
 			"wat": unserializableType{},
 		},
-		Contexts: map[string]interface{}{
-			"wat": unserializableType{},
+		Contexts: map[string]Context{
+			"wat": {"key": unserializableType{}},
 		},
 	})
 
@@ -132,18 +135,125 @@ func TestGetRequestBodyFromEventCompletelyInvalid(t *testing.T) {
 	}
 }
 
-func TestTransactionEnvelopeFromBody(t *testing.T) {
-	const eventID = "b81c5be4d31e48959103a1f878a1efcb"
+func newTestEvent(eventType string) *Event {
+	event := NewEvent()
+	event.Type = eventType
+	event.EventID = "b81c5be4d31e48959103a1f878a1efcb"
+	event.Sdk = SdkInfo{
+		Name:    "sentry.go",
+		Version: "0.0.1",
+	}
+	return event
+}
+
+func newTestDSN(t *testing.T) *Dsn {
+	dsn, err := NewDsn("http://public@example.com/sentry/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dsn
+}
+
+func TestEnvelopeFromErrorBody(t *testing.T) {
+	event := newTestEvent(eventType)
 	sentAt := time.Unix(0, 0).UTC()
-	body := json.RawMessage(`{"type":"transaction","fields":"omitted"}`)
-	b, err := transactionEnvelopeFromBody(eventID, sentAt, body)
+
+	body := json.RawMessage(`{"type":"event","fields":"omitted"}`)
+
+	b, err := envelopeFromBody(event, newTestDSN(t), sentAt, body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := b.String()
-	want := `{"event_id":"b81c5be4d31e48959103a1f878a1efcb","sent_at":"1970-01-01T00:00:00Z"}
+	want := `{"event_id":"b81c5be4d31e48959103a1f878a1efcb","sent_at":"1970-01-01T00:00:00Z","dsn":"http://public@example.com/sentry/1","sdk":{"name":"sentry.go","version":"0.0.1"}}
+{"type":"event","length":35}
+{"type":"event","fields":"omitted"}
+`
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Envelope mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestEnvelopeFromTransactionBody(t *testing.T) {
+	event := newTestEvent(transactionType)
+	sentAt := time.Unix(0, 0).UTC()
+
+	body := json.RawMessage(`{"type":"transaction","fields":"omitted"}`)
+
+	b, err := envelopeFromBody(event, newTestDSN(t), sentAt, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := b.String()
+	want := `{"event_id":"b81c5be4d31e48959103a1f878a1efcb","sent_at":"1970-01-01T00:00:00Z","dsn":"http://public@example.com/sentry/1","sdk":{"name":"sentry.go","version":"0.0.1"}}
 {"type":"transaction","length":41}
 {"type":"transaction","fields":"omitted"}
+`
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Envelope mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestEnvelopeFromEventWithAttachments(t *testing.T) {
+	event := newTestEvent(eventType)
+	event.Attachments = []*Attachment{
+		// Empty content-type and payload
+		{
+			Filename: "empty.txt",
+		},
+		// Non-empty content-type and payload
+		{
+			Filename:    "non-empty.txt",
+			ContentType: "text/html",
+			Payload:     []byte("<h1>Look, HTML</h1>"),
+		},
+	}
+	sentAt := time.Unix(0, 0).UTC()
+
+	body := json.RawMessage(`{"type":"event","fields":"omitted"}`)
+
+	b, err := envelopeFromBody(event, newTestDSN(t), sentAt, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := b.String()
+	want := `{"event_id":"b81c5be4d31e48959103a1f878a1efcb","sent_at":"1970-01-01T00:00:00Z","dsn":"http://public@example.com/sentry/1","sdk":{"name":"sentry.go","version":"0.0.1"}}
+{"type":"event","length":35}
+{"type":"event","fields":"omitted"}
+{"type":"attachment","length":0,"filename":"empty.txt"}
+
+{"type":"attachment","length":19,"filename":"non-empty.txt","content_type":"text/html"}
+<h1>Look, HTML</h1>
+`
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Envelope mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestEnvelopeFromCheckInEvent(t *testing.T) {
+	event := newTestEvent(checkInType)
+	event.CheckIn = &CheckIn{
+		MonitorSlug: "test-slug",
+		ID:          "123c5be4d31e48959103a1f878a1efcb",
+		Status:      CheckInStatusOK,
+	}
+	event.MonitorConfig = &MonitorConfig{
+		Schedule:      IntervalSchedule(1, MonitorScheduleUnitHour),
+		CheckInMargin: 10,
+		MaxRuntime:    5000,
+		Timezone:      "Asia/Singapore",
+	}
+	sentAt := time.Unix(0, 0).UTC()
+
+	body := getRequestBodyFromEvent(event)
+	b, err := envelopeFromBody(event, newTestDSN(t), sentAt, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := b.String()
+	want := `{"event_id":"b81c5be4d31e48959103a1f878a1efcb","sent_at":"1970-01-01T00:00:00Z","dsn":"http://public@example.com/sentry/1","sdk":{"name":"sentry.go","version":"0.0.1"}}
+{"type":"check_in","length":232}
+{"check_in_id":"123c5be4d31e48959103a1f878a1efcb","monitor_slug":"test-slug","status":"ok","monitor_config":{"schedule":{"type":"interval","value":1,"unit":"hour"},"checkin_margin":10,"max_runtime":5000,"timezone":"Asia/Singapore"}}
 `
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("Envelope mismatch (-want +got):\n%s", diff)
@@ -160,18 +270,13 @@ func TestGetRequestFromEvent(t *testing.T) {
 	}{
 		{
 			testName: "Sample Event",
-			event:    NewEvent(),
-			apiURL:   "https://host/path/api/42/store/",
+			event:    newTestEvent(eventType),
+			apiURL:   "https://host/path/api/42/envelope/",
 		},
 		{
 			testName: "Transaction",
-			event: func() *Event {
-				event := NewEvent()
-				event.Type = transactionType
-
-				return event
-			}(),
-			apiURL: "https://host/path/api/42/envelope/",
+			event:    newTestEvent(transactionType),
+			apiURL:   "https://host/path/api/42/envelope/",
 		},
 	}
 
@@ -183,7 +288,7 @@ func TestGetRequestFromEvent(t *testing.T) {
 		}
 
 		t.Run(test.testName, func(t *testing.T) {
-			req, err := getRequestFromEvent(test.event, dsn)
+			req, err := getRequestFromEvent(context.TODO(), test.event, dsn)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -196,8 +301,19 @@ func TestGetRequestFromEvent(t *testing.T) {
 				t.Errorf("Incorrect API URL. want: %s, got: %s", test.apiURL, req.URL.String())
 			}
 
+			userAgent := fmt.Sprintf("%s/%s", test.event.Sdk.Name, test.event.Sdk.Version)
 			if ua := req.UserAgent(); ua != userAgent {
 				t.Errorf("got User-Agent = %q, want %q", ua, userAgent)
+			}
+
+			contentType := "application/x-sentry-envelope"
+			if ct := req.Header.Get("Content-Type"); ct != contentType {
+				t.Errorf("got Content-Type = %q, want %q", ct, contentType)
+			}
+
+			xSentryAuth := "Sentry sentry_version=7, sentry_client=sentry.go/0.0.1, sentry_key=key"
+			if auth := req.Header.Get("X-Sentry-Auth"); !strings.HasPrefix(auth, xSentryAuth) {
+				t.Errorf("got X-Sentry-Auth = %q, want %q", auth, xSentryAuth)
 			}
 		})
 	}
@@ -266,14 +382,14 @@ func TestHTTPTransport(t *testing.T) {
 		e.EventID = EventID(id)
 
 		transport.SendEvent(e)
+
 		t.Logf("[CLIENT] {%.4s} event sent", e.EventID)
 		return id
 	}
 
 	transportMustFlush := func(t *testing.T, id string) {
 		t.Helper()
-
-		ok := transport.Flush(100 * time.Millisecond)
+		ok := transport.Flush(testutils.FlushTimeout())
 		if !ok {
 			t.Fatalf("[CLIENT] {%.4s} Flush() timed out", id)
 		}
@@ -287,8 +403,6 @@ func TestHTTPTransport(t *testing.T) {
 			t.Fatalf("[SERVER] event count = %d, want %d", count, n)
 		}
 	}
-
-	// Actual tests
 
 	testSendSingleEvent := func(t *testing.T) {
 		// Sending a single event should increase the server event count by
@@ -307,6 +421,8 @@ func TestHTTPTransport(t *testing.T) {
 		transportMustFlush(t, id)
 		serverEventCountMustBe(t, initialCount+1)
 	}
+
+	// Actual tests
 	t.Run("SendSingleEvent", testSendSingleEvent)
 
 	t.Run("FlushMultipleTimes", func(t *testing.T) {
@@ -325,12 +441,12 @@ func TestHTTPTransport(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
+			defer wg.Done()
 			testSendSingleEvent(t)
-			wg.Done()
 		}()
 		go func() {
+			defer wg.Done()
 			transportMustFlush(t, "from goroutine")
-			wg.Done()
 		}()
 		wg.Wait()
 	})
@@ -387,7 +503,7 @@ func testKeepAlive(t *testing.T, tr Transport) {
 	checkLastConnReuse := func(reused bool) {
 		t.Helper()
 		reqCount++
-		if !tr.Flush(time.Second) {
+		if !tr.Flush(testutils.FlushTimeout()) {
 			t.Fatal("Flush timed out")
 		}
 		if len(rt.reusedConn) != reqCount {
@@ -459,7 +575,7 @@ func testRateLimiting(t *testing.T, tr Transport) {
 
 	// Test server that simulates responses with rate limits.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, err := ioutil.ReadAll(r.Body)
+		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			panic(err)
 		}
@@ -501,7 +617,7 @@ func testRateLimiting(t *testing.T, tr Transport) {
 	}()
 	wg.Wait()
 
-	if !tr.Flush(time.Second) {
+	if !tr.Flush(testutils.FlushTimeout()) {
 		t.Fatal("Flush timed out")
 	}
 
@@ -513,4 +629,42 @@ func testRateLimiting(t *testing.T, tr Transport) {
 	if n := atomic.LoadUint64(&transactionEventCount); n != 1 {
 		t.Errorf("got transactionEvent = %d, want %d", n, 1)
 	}
+}
+
+func TestHTTPTransportDoesntLeakGoroutines(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	transport := NewHTTPTransport()
+	transport.Configure(ClientOptions{
+		Dsn:        "https://test@foobar/1",
+		HTTPClient: http.DefaultClient,
+	})
+
+	transport.Flush(0)
+	transport.Close()
+}
+
+func TestHTTPTransportClose(t *testing.T) {
+	transport := NewHTTPTransport()
+	transport.Configure(ClientOptions{
+		Dsn:        "https://test@foobar/1",
+		HTTPClient: http.DefaultClient,
+	})
+
+	transport.Close()
+
+	select {
+	case <-transport.done:
+	case <-time.After(time.Second):
+		t.Error("transport.done not closed after Close")
+	}
+}
+
+func TestHTTPSyncTransportClose(t *testing.T) {
+	// Close does not do anything for HTTPSyncTransport, added for coverage.
+	transport := HTTPSyncTransport{}
+	transport.Close()
+
+	tr := noopTransport{}
+	tr.Close()
 }

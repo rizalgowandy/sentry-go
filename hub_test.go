@@ -3,6 +3,8 @@ package sentry
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -10,8 +12,10 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
+const testDsn = "http://whatever@example.com/1337"
+
 func setupHubTest() (*Hub, *Client, *Scope) {
-	client, _ := NewClient(ClientOptions{Dsn: "http://whatever@really.com/1337"})
+	client, _ := NewClient(ClientOptions{Dsn: testDsn, Transport: &TransportMock{}})
 	scope := NewScope()
 	hub := NewHub(client, scope)
 	return hub, client, scope
@@ -93,7 +97,7 @@ func TestPopScopeCannotLeaveStackEmpty(t *testing.T) {
 func TestBindClient(t *testing.T) {
 	hub, client, _ := setupHubTest()
 	hub.PushScope()
-	newClient, _ := NewClient(ClientOptions{Dsn: "http://whatever@really.com/1337"})
+	newClient, _ := NewClient(ClientOptions{Dsn: testDsn, Transport: &TransportMock{}})
 	hub.BindClient(newClient)
 
 	if (*hub.stack)[0].client == (*hub.stack)[1].client {
@@ -121,7 +125,7 @@ func TestWithScopeBindClient(t *testing.T) {
 	hub, client, _ := setupHubTest()
 
 	hub.WithScope(func(scope *Scope) {
-		newClient, _ := NewClient(ClientOptions{Dsn: "http://whatever@really.com/1337"})
+		newClient, _ := NewClient(ClientOptions{Dsn: testDsn, Transport: &TransportMock{}})
 		hub.BindClient(newClient)
 		if hub.stackTop().client != newClient {
 			t.Error("should use newly bound client")
@@ -320,6 +324,87 @@ func TestHasHubOnContextReturnsTrueIfHubIsThere(t *testing.T) {
 func TestHasHubOnContextReturnsFalseIfHubIsNotThere(t *testing.T) {
 	ctx := context.Background()
 	assertEqual(t, false, HasHubOnContext(ctx))
+}
+
+func TestGetTraceparent(t *testing.T) {
+	tests := map[string]struct {
+		hub      *Hub
+		expected string
+	}{
+		"With span": {
+			hub: func() *Hub {
+				h, _, s := setupHubTest()
+				s.span = &Span{
+					TraceID: TraceIDFromHex("d49d9bf66f13450b81f65bc51cf49c03"),
+					SpanID:  SpanIDFromHex("a9f442f9330b4e09"),
+					Sampled: SampledTrue,
+				}
+				return h
+			}(),
+			expected: "d49d9bf66f13450b81f65bc51cf49c03-a9f442f9330b4e09-1",
+		},
+		"Without span": {
+			hub: func() *Hub {
+				h, _, s := setupHubTest()
+				s.propagationContext.TraceID = TraceIDFromHex("d49d9bf66f13450b81f65bc51cf49c03")
+				s.propagationContext.SpanID = SpanIDFromHex("a9f442f9330b4e09")
+				return h
+			}(),
+			expected: "d49d9bf66f13450b81f65bc51cf49c03-a9f442f9330b4e09",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			result := tt.hub.GetTraceparent()
+			assertEqual(t, result, tt.expected)
+		})
+	}
+}
+
+func TestGetBaggage(t *testing.T) {
+	tests := map[string]struct {
+		hub      *Hub
+		expected string
+	}{
+		"With span": {
+			hub: func() *Hub {
+				h, _, s := setupHubTest()
+				s.span = &Span{
+					dynamicSamplingContext: DynamicSamplingContext{
+						Entries: map[string]string{"sample_rate": "1", "release": "1.0.0", "environment": "production"},
+					},
+					recorder: &spanRecorder{},
+					ctx:      context.Background(),
+					Sampled:  SampledTrue,
+				}
+
+				s.span.spanRecorder().record(s.span)
+
+				return h
+			}(),
+			expected: "sentry-environment=production,sentry-release=1.0.0,sentry-sample_rate=1",
+		},
+		"Without span": {
+			hub: func() *Hub {
+				h, _, s := setupHubTest()
+				s.propagationContext.DynamicSamplingContext = DynamicSamplingContext{
+					Entries: map[string]string{"release": "1.0.0", "environment": "production"},
+				}
+				return h
+			}(),
+			expected: "sentry-environment=production,sentry-release=1.0.0",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			result := tt.hub.GetBaggage()
+			res := strings.Split(result, ",")
+			slices.Sort(res)
+			assertEqual(t, strings.Join(res, ","), tt.expected)
+		})
+	}
 }
 
 func TestGetHubFromContext(t *testing.T) {
