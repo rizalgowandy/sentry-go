@@ -4,12 +4,16 @@ package sentryhttp
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/getsentry/sentry-go"
+	"github.com/getsentry/sentry-go/internal/httputils"
+	"github.com/getsentry/sentry-go/internal/traceutils"
 )
+
+// The identifier of the HTTP SDK.
+const sdkIdentifier = "sentry.go.http"
 
 // A Handler is an HTTP middleware factory that provides integration with
 // Sentry.
@@ -49,13 +53,13 @@ type Options struct {
 // New returns a new Handler. Use the Handle and HandleFunc methods to wrap
 // existing HTTP handlers.
 func New(options Options) *Handler {
-	timeout := options.Timeout
-	if timeout == 0 {
-		timeout = 2 * time.Second
+	if options.Timeout == 0 {
+		options.Timeout = 2 * time.Second
 	}
+
 	return &Handler{
 		repanic:         options.Repanic,
-		timeout:         timeout,
+		timeout:         options.Timeout,
 		waitForDelivery: options.WaitForDelivery,
 	}
 }
@@ -71,9 +75,9 @@ func (h *Handler) Handle(handler http.Handler) http.Handler {
 // where that is convenient. In particular, use it to wrap a handler function
 // literal.
 //
-//  http.Handle(pattern, h.HandleFunc(func (w http.ResponseWriter, r *http.Request) {
-//      // handler code here
-//  }))
+//	http.Handle(pattern, h.HandleFunc(func (w http.ResponseWriter, r *http.Request) {
+//	    // handler code here
+//	}))
 func (h *Handler) HandleFunc(handler http.HandlerFunc) http.HandlerFunc {
 	return h.handle(handler)
 }
@@ -81,26 +85,43 @@ func (h *Handler) HandleFunc(handler http.HandlerFunc) http.HandlerFunc {
 func (h *Handler) handle(handler http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		hub := sentry.GetHubFromContext(ctx)
+		hub := sentry.GetHubFromContext(r.Context())
 		if hub == nil {
 			hub = sentry.CurrentHub().Clone()
 			ctx = sentry.SetHubOnContext(ctx, hub)
 		}
-		span := sentry.StartSpan(ctx, "http.server",
-			sentry.TransactionName(fmt.Sprintf("%s %s", r.Method, r.URL.Path)),
-			sentry.ContinueFromRequest(r),
+
+		if client := hub.Client(); client != nil {
+			client.SetSDKIdentifier(sdkIdentifier)
+		}
+
+		options := []sentry.SpanOption{
+			sentry.ContinueTrace(hub, r.Header.Get(sentry.SentryTraceHeader), r.Header.Get(sentry.SentryBaggageHeader)),
+			sentry.WithOpName("http.server"),
+			sentry.WithTransactionSource(sentry.SourceURL),
+			sentry.WithSpanOrigin(sentry.SpanOriginStdLib),
+		}
+
+		transaction := sentry.StartTransaction(ctx,
+			traceutils.GetHTTPSpanName(r),
+			options...,
 		)
-		defer span.Finish()
-		// TODO(tracing): if the next handler.ServeHTTP panics, store
-		// information on the transaction accordingly (status, tag,
-		// level?, ...).
-		r = r.WithContext(span.Context())
+		transaction.SetData("http.request.method", r.Method)
+
+		rw := httputils.NewWrapResponseWriter(w, r.ProtoMajor)
+
+		defer func() {
+			status := rw.Status()
+			transaction.Status = sentry.HTTPtoSpanStatus(status)
+			transaction.SetData("http.response.status_code", status)
+			transaction.Finish()
+		}()
+
 		hub.Scope().SetRequest(r)
+		r = r.WithContext(transaction.Context())
 		defer h.recoverWithSentry(hub, r)
-		// TODO(tracing): use custom response writer to intercept
-		// response. Use HTTP status to add tag to transaction; set span
-		// status.
-		handler.ServeHTTP(w, r)
+
+		handler.ServeHTTP(rw, r)
 	}
 }
 
